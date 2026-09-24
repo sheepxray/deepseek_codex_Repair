@@ -18,7 +18,7 @@ Responses API 客户端（如 Codex 等）的请求历史中经常出现四类�
 代理在转发前自动修复这些问题，客户端无需改动。
 
 ```
-[客户端] --POST /v1/responses（input[] 可能损坏）--> [代理 127.0.0.1:8080] --> [UPSTREAM_URL]
+[客户端] --POST /v1/responses（input[] 可能损坏）--> [代理 127.0.0.1:16889] --> [UPSTREAM_URL]
     ^                                                     | 修复 input[]             |
     +---------- SSE 字节流 / JSON 原样 + X-Proxy-Repairs 头 +-------------------------+
 ```
@@ -31,7 +31,7 @@ Responses API 客户端（如 Codex 等）的请求历史中经常出现四类�
 2. 把客户端的 `base_url` 指向代理：
 
 ```
-http://127.0.0.1:8080/v1    （或 http://127.0.0.1:8080，路径原样中继）
+http://127.0.0.1:16889/v1    （或 http://127.0.0.1:16889，路径原样中继）
 ```
 
 3. 保留客户端原有的 DeepSeek API key（代理原样转发）；如需代理统一注入 key，设置环境变量 `PROXY_API_KEY`
@@ -40,7 +40,7 @@ http://127.0.0.1:8080/v1    （或 http://127.0.0.1:8080，路径原样中继）
 
 ```bash
 pip install -r requirements.txt
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8080
+python -m uvicorn app.main:app --host 127.0.0.1 --port 16889
 ```
 
 ## 修复规则
@@ -143,7 +143,7 @@ DeepSeek V4 思考模式的 Responses API **无状态**，要求客户端每轮�
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `PROXY_HOST` | `127.0.0.1` | 监听地址 |
-| `PROXY_PORT` | `8080` | 监听端口 |
+| `PROXY_PORT` | `16889` | 监听端口 |
 | `UPSTREAM_URL` | `https://api.deepseek.com` | 上游基址，路径/查询串原样拼接 |
 | `PROXY_API_KEY` | 未设 | 设置则覆盖客户端 Authorization |
 | `ORPHAN_STRATEGY` | `convert_to_user` | 孤立输出策略：`convert_to_user` / `convert_to_developer` / `remove` |
@@ -189,9 +189,9 @@ python -m pytest -q        # 82 个用例：修复规则单测 + 配置校验 + 
 curl 冒烟（用真实 key 走真实 DeepSeek）：
 
 ```bash
-curl http://127.0.0.1:8080/healthz
+curl http://127.0.0.1:16889/healthz
 # 构造损坏请求：孤立输出 call_dead
-curl -i -X POST http://127.0.0.1:8080/v1/responses -H "Authorization: Bearer sk-<key>" -H "Content-Type: application/json" ^
+curl -i -X POST http://127.0.0.1:16889/v1/responses -H "Authorization: Bearer sk-<key>" -H "Content-Type: application/json" ^
   -d "{\"model\":\"deepseek-chat\",\"input\":[{\"type\":\"function_call\",\"name\":\"get_weather\",\"arguments\":\"{}\",\"call_id\":\"call_1\"},{\"type\":\"function_call_output\",\"call_id\":\"call_dead\",\"output\":\"sunny\"}],\"stream\":false}"
 ```
 
@@ -200,11 +200,11 @@ curl -i -X POST http://127.0.0.1:8080/v1/responses -H "Authorization: Bearer sk-
 | 症状 | 原因 | 解决 |
 |---|---|---|
 | `No module named uvicorn` | 首次安装失败（PyPI 直连超时） | 重新双击 `run_proxy.bat`，脚本会自动重试（镜像优先）；或手动 `pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt` |
-| 客户端 `connection refused` | 代理未启动 | 先启动代理，`curl http://127.0.0.1:8080/healthz` 验证 |
+| 客户端 `connection refused` | 代理未启动 | 先启动代理，`curl http://127.0.0.1:16889/healthz` 验证 |
 | 上游 401 | API key 未转发 | 确认客户端带了 `Authorization: Bearer <key>`；或设置 `PROXY_API_KEY` 统一注入 |
 | 仍有 400 报错 | 存在未覆盖的坏数据 | `DEBUG_DUMP=1` 后把 `%TEMP%` 里的修复前后请求对比发出来分析 |
 | 回注后仍报 reasoning 400 | 缓存里没有该轮的 reasoning（代理重启过且缓存文件被删/被清理，或该轮请求发生在代理启动前） | 确认 `%TEMP%\deepseek_codex_reasoning_cache.json` 存在且未被清理；把缓存文件删掉重开新会话让代理重新捕获 |
-| `[Errno 10048]` 端口被占用 | 8080 已被占用 | `set PROXY_PORT=其他端口` 后重启 |
+| `[Errno 10048]` 端口被占用 | 16889 已被占用 | `set PROXY_PORT=其他端口` 后重启 |
 
 ## 局限性
 

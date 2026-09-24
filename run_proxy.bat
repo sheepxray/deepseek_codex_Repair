@@ -9,7 +9,7 @@ REM PROXY_API_KEY, ORPHAN_STRATEGY, MISSING_ID_STRATEGY, DEBUG_DUMP, LOG_LEVEL.
 cd /d "%~dp0"
 
 if not defined PROXY_HOST set PROXY_HOST=127.0.0.1
-if not defined PROXY_PORT set PROXY_PORT=8080
+if not defined PROXY_PORT set PROXY_PORT=16889
 
 REM --- dependency check: are the runtime deps actually importable? ---
 ".venv\Scripts\python.exe" -c "import uvicorn, fastapi, httpx" >nul 2>nul

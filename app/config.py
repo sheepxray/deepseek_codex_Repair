@@ -19,7 +19,7 @@ _TRUE_VALUES = ("1", "true", "yes", "on")
 @dataclass(frozen=True)
 class Settings:
     proxy_host: str = "127.0.0.1"
-    proxy_port: int = 8080
+    proxy_port: int = 16889
     upstream_url: str = "https://api.deepseek.com"
     proxy_api_key: str | None = None  # None/"" → 原样转发客户端 Authorization
     orphan_strategy: str = "convert_to_user"
@@ -56,9 +56,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         )
 
     try:
-        port = int(_get("PROXY_PORT", "8080"))
+        port = int(_get("PROXY_PORT", "16889"))
     except ValueError:
-        raise ValueError(f"PROXY_PORT must be an integer, got {_get('PROXY_PORT', '8080')!r}") from None
+        raise ValueError(f"PROXY_PORT must be an integer, got {_get('PROXY_PORT', '16889')!r}") from None
 
     try:
         max_body = int(_get("MAX_BODY_BYTES", "52428800"))
