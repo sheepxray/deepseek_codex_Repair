@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -20,9 +22,28 @@ from fastapi.responses import JSONResponse
 from app.config import Settings, load_settings
 from app.debug_dump import save_debug_dump
 from app.proxy import build_upstream_url, create_client, filter_client_headers, forward
+from app.reasoning_cache import ReasoningCache
 from app.repair import RepairConfig, repair_input_items
 
 logger = logging.getLogger("app.main")
+
+DEFAULT_REASONING_CACHE_FILE = Path(tempfile.gettempdir()) / "deepseek_codex_reasoning_cache.json"
+
+
+def _make_reasoning_lookup(cache: ReasoningCache):
+    """构建 repair 用的回注查找函数: item -> 缓存 reasoning_text 或 None。"""
+
+    def lookup(item: dict) -> str | None:
+        cid = item.get("call_id")
+        if isinstance(cid, str) and cid:
+            text = cache.get_call(cid)
+            if text:
+                return text
+        if item.get("type") == "message":
+            return cache.get_message(item.get("content"))
+        return None
+
+    return lookup
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -52,9 +73,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await app.state.client.aclose()
 
     app = FastAPI(title="deepseek-codex-repair-proxy", lifespan=lifespan)
-    # settings/repair_config 挂到 state（ASGITransport 测试不经 lifespan 也可用）
+    # settings/repair_config/缓存挂到 state（ASGITransport 测试不经 lifespan 也可用）
     app.state.settings = settings
     app.state.repair_config = repair_config
+    cache_file = Path(settings.reasoning_cache_file) if settings.reasoning_cache_file else DEFAULT_REASONING_CACHE_FILE
+    app.state.reasoning_cache = ReasoningCache(
+        file_path=cache_file,
+        max_entries=settings.reasoning_cache_max_entries,
+    )
+    app.state.reasoning_lookup = (
+        _make_reasoning_lookup(app.state.reasoning_cache)
+        if settings.restore_reasoning
+        else None
+    )
 
     @app.get("/healthz")
     async def healthz():
@@ -81,7 +112,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         repairs_count = 0
         if isinstance(body, dict) and isinstance(body.get("input"), list):
-            repaired, report = repair_input_items(body["input"], cfg)
+            repaired, report = repair_input_items(
+                body["input"], cfg,
+                reasoning_lookup=request.app.state.reasoning_lookup,
+            )
             repairs_count = report.count
             if repairs_count:
                 body["input"] = repaired
@@ -98,7 +132,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         headers = filter_client_headers(request, st)
         headers["content-type"] = "application/json"
         upstream_req = client.build_request("POST", url, headers=headers, content=new_body)
-        return await forward(client, upstream_req, repairs_count)
+        return await forward(
+            client, upstream_req, repairs_count,
+            cache=request.app.state.reasoning_cache,
+        )
 
     @app.api_route(
         "/{path:path}",

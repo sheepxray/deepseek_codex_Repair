@@ -68,6 +68,33 @@ def _is_function_call_output(item: Any) -> bool:
     return isinstance(item, dict) and item.get("type") == "function_call_output"
 
 
+def _is_reasoning(item: Any) -> bool:
+    return isinstance(item, dict) and item.get("type") == "reasoning"
+
+
+def _needs_reasoning(item: Any) -> bool:
+    """需要回传 reasoning_text 的 item: function_call / custom_tool_call / assistant 消息。"""
+    if not isinstance(item, dict):
+        return False
+    itype = item.get("type")
+    if itype in ("function_call", "custom_tool_call"):
+        return True
+    return itype == "message" and item.get("role") == "assistant"
+
+
+def _reasoning_plaintext(item: dict) -> str | None:
+    """取 reasoning item 的纯文本内容；无 reasoning_text parts 返回 None。"""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return None
+    texts = [
+        p.get("text")
+        for p in content
+        if isinstance(p, dict) and p.get("type") == "reasoning_text" and p.get("text")
+    ]
+    return "\n".join(texts) if texts else None
+
+
 def _get_call_id(item: dict) -> str | None:
     """取合法 call_id；缺失/空串/非字符串一律返回 None。"""
     cid = item.get("call_id")
@@ -173,6 +200,61 @@ def _pass_sanitize_non_dict(source: list, report: RepairReport) -> list[tuple[in
             continue
         wrapped.append((i, item))
     return wrapped
+
+
+def _pass_restore_reasoning(
+    wrapped: list[tuple[int, dict]],
+    report: RepairReport,
+    reasoning_lookup,
+) -> list[tuple[int, dict]]:
+    """Pass 0.5: 回注缓存的上游 reasoning_text。
+
+    DeepSeek V4 思考模式要求 reasoning_text 在后续轮次原样回传。
+    客户端重放历史时若丢了 reasoning 块，此处按 call_id / 消息内容哈希
+    从缓存查找并注入（或修复仅含 encrypted_content/summary 的坏块）。
+
+    reasoning_lookup(item) -> str | None，由 main 从 ReasoningCache 构建。
+    """
+    if reasoning_lookup is None:
+        return wrapped
+    out: list[tuple[int, dict]] = []
+    for orig_i, item in wrapped:
+        if _needs_reasoning(item):
+            prev = out[-1][1] if out else None
+            if _is_reasoning(prev):
+                if _reasoning_plaintext(prev) is None:
+                    # 有 reasoning item 但只有 summary/encrypted_content（上游不支持
+                    # 这两个字段）→ 整体替换为仅含纯文本的干净 item，避免重复注入
+                    text = reasoning_lookup(item)
+                    if text:
+                        out[-1] = (
+                            out[-1][0],
+                            {
+                                "type": "reasoning",
+                                "content": [{"type": "reasoning_text", "text": text}],
+                            },
+                        )
+                        report.add(
+                            "fix_reasoning_item_plaintext", orig_i,
+                            "replaced non-plaintext reasoning with cached text",
+                        )
+                # 已有纯文本 reasoning → 无需处理
+            else:
+                text = reasoning_lookup(item)
+                if text:
+                    out.append((
+                        orig_i,
+                        {
+                            "type": "reasoning",
+                            "content": [{"type": "reasoning_text", "text": text}],
+                        },
+                    ))
+                    report.add(
+                        "restore_reasoning_text", orig_i,
+                        f"injected cached reasoning ({len(text)} chars)",
+                    )
+        out.append((orig_i, item))
+    return out
 
 
 def _pass_fix_function_call_ids(
@@ -367,6 +449,7 @@ def _pass_validate(wrapped: list[tuple[int, dict]]) -> None:
 def repair_input_items(
     items: Any,
     config: RepairConfig | None = None,
+    reasoning_lookup=None,
 ) -> tuple[list, RepairReport]:
     """纯修复 OpenAI Responses API 的 input 数组。
 
@@ -375,6 +458,8 @@ def repair_input_items(
     Args:
         items: Responses API 请求的 input 数组（可能损坏）。
         config: 修复策略配置，None 用默认。
+        reasoning_lookup: 可选的 reasoning 回注查找函数
+            (item: dict) -> str | None。None 时跳过 reasoning 回注。
 
     Returns:
         (修复后的 items 列表, 修复报告)。
@@ -390,6 +475,9 @@ def repair_input_items(
 
     # Pass 0: 清理非法 item
     wrapped = _pass_sanitize_non_dict(source, report)
+
+    # Pass 0.5: 回注缓存的 reasoning_text（在配对修复前，保证不影响 fc/fco 相邻关系）
+    wrapped = _pass_restore_reasoning(wrapped, report, reasoning_lookup)
 
     # 已占用的 call_id 集合（原 fc 的 + 合成的），供唯一性检查
     used_ids = {

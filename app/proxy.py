@@ -11,12 +11,16 @@
 
 from __future__ import annotations
 
+import json
 import logging
 
 import anyio
 import httpx
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+
+from app.capture import SseCapture, capture_from_response_json
+from app.reasoning_cache import ReasoningCache
 
 logger = logging.getLogger("app.proxy")
 
@@ -81,10 +85,12 @@ async def forward(
     client: httpx.AsyncClient,
     upstream_req: httpx.Request,
     repairs_count: int = 0,
+    cache: ReasoningCache | None = None,
 ):
     """转发请求；连接期错误在此抛出前映射为 JSON 错误响应。
 
     repairs_count > 0 时附加 X-Proxy-Repairs 响应头（count=0 不加）。
+    cache 非 None 时从上游响应捕获 reasoning_text（流式边转发边捕获）。
     """
     try:
         resp = await client.send(upstream_req, stream=True)
@@ -107,10 +113,15 @@ async def forward(
         if repairs_count > 0:
             headers["x-proxy-repairs"] = str(repairs_count)
 
+        sse_capture = SseCapture(cache) if cache is not None else None
+
         async def stream_body():
-            # aiter_raw(): 原始字节逐块中继，无 SSE 重构、无文本解码
+            # aiter_raw(): 原始字节逐块中继，无 SSE 重构、无文本解码；
+            # 捕获器同步喂入同样字节，不产生延迟
             try:
                 async for chunk in resp.aiter_raw():
+                    if sse_capture is not None:
+                        sse_capture.feed(chunk)
                     yield chunk
             except (anyio.ClosedResourceError, GeneratorExit):
                 return  # 客户端断连
@@ -125,6 +136,12 @@ async def forward(
 
     content = await resp.aread()
     await resp.aclose()
+    if cache is not None and "application/json" in content_type:
+        try:
+            data = json.loads(content)
+            capture_from_response_json(data, cache)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.debug("upstream JSON response unparseable for capture: %s", exc)
     headers = passthrough_response_headers(resp, streaming=False)
     if repairs_count > 0:
         headers["x-proxy-repairs"] = str(repairs_count)

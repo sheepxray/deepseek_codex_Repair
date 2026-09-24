@@ -231,3 +231,104 @@ async def test_healthz_no_upstream_call(harness_factory):
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "upstream": "https://example.com"}
     assert h.upstream_requests == []
+
+
+# ---- reasoning_text 回传修复（DeepSeek 思考模式） ----
+
+
+_REASONING_RESPONSE = {
+    "id": "resp_1",
+    "output": [
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "先查天气再回答"}]},
+        {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{}"},
+    ],
+}
+
+
+def _replay_input():
+    """模拟客户端第二轮回放：function_call + output，但丢了 reasoning 块。"""
+    return [
+        {"type": "message", "role": "user", "content": "北京天气如何"},
+        _fc("call_1"),
+        _fco("call_1", "晴"),
+    ]
+
+
+async def test_reasoning_restore_e2e_non_stream(harness_factory):
+    captured = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        # 第一轮：上游返回 reasoning + function_call（代理应捕获）
+        return httpx.Response(200, json=_REASONING_RESPONSE, headers={"content-type": "application/json"})
+
+    h = harness_factory(Settings(), handler)
+    async with h.client() as client:
+        # 第一轮（触发捕获）
+        r1 = await client.post("/v1/responses", json={"model": "m", "input": "北京天气如何"})
+        assert r1.status_code == 200
+        assert "x-proxy-repairs" not in r1.headers
+
+        # 第二轮：客户端重放历史但丢了 reasoning → 代理应回注
+        r2 = await client.post("/v1/responses", json={"model": "m", "input": _replay_input()})
+        assert r2.status_code == 200
+        assert r2.headers["x-proxy-repairs"] == "1"
+
+    upstream_input = captured[1]["input"]
+    assert upstream_input[0] == {"type": "message", "role": "user", "content": "北京天气如何"}
+    assert upstream_input[1]["type"] == "reasoning"
+    assert upstream_input[1]["content"] == [{"type": "reasoning_text", "text": "先查天气再回答"}]
+    assert upstream_input[2] == _fc("call_1")
+    assert upstream_input[3] == _fco("call_1", "晴")
+
+
+async def test_reasoning_restore_e2e_streaming_capture(harness_factory):
+    sse_stream = b"".join([
+        b'event: response.output_item.added\ndata: {"item":{"type":"reasoning","content":[]}}\n\n',
+        b'event: response.reasoning_text.delta\ndata: {"delta":"stream thinking"}\n\n',
+        b'event: response.output_item.added\n'
+        b'data: {"item":{"type":"function_call","call_id":"call_1","name":"get_weather"}}\n\n',
+    ])
+    captured = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        # 第一轮流式返回，第二轮普通返回
+        if len(captured) == 1:
+            return httpx.Response(
+                200, stream=httpx.ByteStream(sse_stream),
+                headers={"content-type": "text/event-stream"},
+            )
+        return httpx.Response(200, json={"id": "resp_2"}, headers={"content-type": "application/json"})
+
+    h = harness_factory(Settings(), handler)
+    async with h.client() as client:
+        r1 = await client.post("/v1/responses", json={"model": "m", "input": "q", "stream": True})
+        assert r1.status_code == 200
+
+        r2 = await client.post("/v1/responses", json={"model": "m", "input": _replay_input()})
+        assert r2.status_code == 200
+        assert r2.headers["x-proxy-repairs"] == "1"
+
+    upstream_input = captured[1]["input"]
+    assert upstream_input[0] == {"type": "message", "role": "user", "content": "北京天气如何"}
+    assert upstream_input[1]["type"] == "reasoning"
+    assert upstream_input[1]["content"] == [{"type": "reasoning_text", "text": "stream thinking"}]
+
+
+async def test_reasoning_restore_disabled_by_settings(harness_factory):
+    captured = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=_REASONING_RESPONSE, headers={"content-type": "application/json"})
+
+    h = harness_factory(Settings(restore_reasoning=False), handler)
+    async with h.client() as client:
+        await client.post("/v1/responses", json={"model": "m", "input": "q"})
+        r2 = await client.post("/v1/responses", json={"model": "m", "input": _replay_input()})
+        assert r2.status_code == 200
+        assert "x-proxy-repairs" not in r2.headers  # 不修复
+
+    # 上游收到的第二轮 input 没有注入 reasoning
+    assert captured[1]["input"][0]["type"] == "message"

@@ -25,6 +25,9 @@ class Settings:
     orphan_strategy: str = "convert_to_user"
     missing_id_strategy: str = "synthesize"
     synthetic_call_prefix: str = "call_proxy_"
+    restore_reasoning: bool = True  # 回注缓存的 reasoning_text（DeepSeek 思考模式要求回传）
+    reasoning_cache_file: str | None = None  # None → %TEMP%\deepseek_codex_reasoning_cache.json
+    reasoning_cache_max_entries: int = 10000
     log_level: str = "INFO"
     debug_dump: bool = False
     max_body_bytes: int = 52_428_800  # 50 MiB
@@ -74,6 +77,16 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     api_key = _get("PROXY_API_KEY", "") or None
     debug_dump = _get("DEBUG_DUMP", "0").strip().lower() in _TRUE_VALUES
 
+    try:
+        cache_max = int(_get("REASONING_CACHE_MAX_ENTRIES", "10000"))
+    except ValueError:
+        raise ValueError(
+            f"REASONING_CACHE_MAX_ENTRIES must be an integer, got "
+            f"{_get('REASONING_CACHE_MAX_ENTRIES', '10000')!r}"
+        ) from None
+
+    restore_reasoning = _get("RESTORE_REASONING", "1").strip().lower() not in ("0", "false", "no", "off")
+
     return Settings(
         proxy_host=_get("PROXY_HOST", "127.0.0.1"),
         proxy_port=port,
@@ -82,6 +95,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         orphan_strategy=orphan,
         missing_id_strategy=missing,
         synthetic_call_prefix=_get("SYNTHETIC_CALL_PREFIX", "call_proxy_"),
+        restore_reasoning=restore_reasoning,
+        reasoning_cache_file=_get("REASONING_CACHE_FILE", "") or None,
+        reasoning_cache_max_entries=cache_max,
         log_level=_get("LOG_LEVEL", "INFO"),
         debug_dump=debug_dump,
         max_body_bytes=max_body,

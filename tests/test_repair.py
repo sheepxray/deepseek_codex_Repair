@@ -231,3 +231,111 @@ def test_empty_and_garbage_input_never_raises():
     assert repaired is None and report.count == 0
     repaired, report = repair_input_items({"type": "message"})
     assert repaired == {"type": "message"} and report.count == 0
+
+
+# ---- 规则: reasoning_text 回注（DeepSeek 思考模式） ----
+
+
+def _lookup_mapping(mapping: dict) -> callable:
+    """构造按 call_id / 消息内容查找的 lookup。"""
+
+    def lookup(item):
+        cid = item.get("call_id")
+        if cid in mapping:
+            return mapping[cid]
+        if item.get("type") == "message" and isinstance(item.get("content"), str):
+            return mapping.get(item["content"])
+        return None
+
+    return lookup
+
+
+def test_restore_reasoning_injected_before_function_call():
+    items = [fc("call_1"), fco("call_1", "r")]
+    lookup = _lookup_mapping({"call_1": "先查天气"})
+    repaired, report = repair_input_items(items, reasoning_lookup=lookup)
+    assert len(repaired) == 3
+    assert repaired[0] == {
+        "type": "reasoning",
+        "content": [{"type": "reasoning_text", "text": "先查天气"}],
+    }
+    assert repaired[1] == fc("call_1")
+    assert repaired[2] == fco("call_1", "r")
+    assert rules(report) == ["restore_reasoning_text"]
+    assert report.entries[0].index == 0
+
+
+def test_restore_reasoning_skips_when_already_present():
+    items = [
+        {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "已有"}]},
+        fc("call_1"),
+        fco("call_1", "r"),
+    ]
+    lookup = _lookup_mapping({"call_1": "先查天气"})
+    repaired, report = repair_input_items(items, reasoning_lookup=lookup)
+    assert repaired == items  # 不重复注入
+    assert report.count == 0
+
+
+def test_restore_reasoning_fixes_non_plaintext_reasoning_item():
+    items = [
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "摘要"}],
+         "encrypted_content": "enc"},
+        fc("call_1"),
+        fco("call_1", "r"),
+    ]
+    lookup = _lookup_mapping({"call_1": "缓存纯文本"})
+    repaired, report = repair_input_items(items, reasoning_lookup=lookup)
+    assert repaired[0] == {
+        "type": "reasoning",
+        "content": [{"type": "reasoning_text", "text": "缓存纯文本"}],
+    }
+    assert rules(report) == ["fix_reasoning_item_plaintext"]
+
+
+def test_restore_reasoning_no_cache_hit_no_injection():
+    items = [fc("call_1"), fco("call_1", "r")]
+    repaired, report = repair_input_items(items, reasoning_lookup=_lookup_mapping({}))
+    assert repaired == items
+    assert report.count == 0
+
+
+def test_restore_reasoning_none_lookup_skips_pass():
+    items = [fc("call_1"), fco("call_1", "r")]
+    repaired, report = repair_input_items(items)  # 不传 lookup
+    assert repaired == items
+    assert report.count == 0
+
+
+def test_restore_reasoning_before_assistant_message():
+    items = [msg("assistant", "答案是 42")]
+    lookup = _lookup_mapping({"答案是 42": "算一下"})
+    repaired, report = repair_input_items(items, reasoning_lookup=lookup)
+    assert repaired[0] == {
+        "type": "reasoning",
+        "content": [{"type": "reasoning_text", "text": "算一下"}],
+    }
+    assert repaired[1] == msg("assistant", "答案是 42")
+    assert rules(report) == ["restore_reasoning_text"]
+
+
+def test_restore_reasoning_not_applied_to_user_messages():
+    items = [msg("user", "你好")]
+    lookup = _lookup_mapping({"你好": "不该注入"})
+    repaired, report = repair_input_items(items, reasoning_lookup=lookup)
+    assert repaired == items
+    assert report.count == 0
+
+
+def test_restore_reasoning_combined_with_pairing_repairs():
+    # 回注 reasoning 的同时，缺 call_id 的配对修复照常工作
+    items = [fc("call_1"), fco(None, "r")]
+    lookup = _lookup_mapping({"call_1": "先查天气"})
+    repaired, report = repair_input_items(items, reasoning_lookup=lookup)
+    assert len(repaired) == 3
+    assert repaired[0]["type"] == "reasoning"
+    assert repaired[2]["call_id"] == "call_1"  # 配对修复仍生效
+    assert rules(report) == [
+        "restore_reasoning_text",
+        "adopt_call_id_from_preceding_function_call",
+    ]
